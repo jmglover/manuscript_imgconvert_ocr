@@ -1,24 +1,25 @@
 # Manuscript OCR
 
-Convert a folder of HEIC manuscript photos to PNG, OCR them into a collated
-searchable text file, and produce a compact searchable PDF (page images with an
-invisible, selectable text layer).
+Convert a folder of HEIC manuscript photos into ordinary image files, OCR them
+into a collated searchable text file, and produce a compact searchable PDF (page
+images with an invisible, selectable text layer).
 
 The work is split into two stages so you can run them independently:
 
-1. **convert** — turn the HEIC photos into PNGs (fast, free, done once).
-2. **ocr** — run OCR over those PNGs (the slow / costly / experiment-y part).
+1. **convert** — turn the HEIC photos into JPEGs (fast, free, done once).
+2. **ocr** — run OCR over those images (the slow / costly / experiment-y part).
 
-Because the converted PNGs are written to disk, you can convert once and then OCR
-as many times as you like — for instance Tesseract first, then Google Vision
-later — without redoing the conversion. OCR outputs are **named after the engine**,
-so repeated runs sit side by side instead of overwriting each other.
+Because the converted images are written to disk, you can convert once and then
+OCR as many times as you like — Tesseract first, Google Vision later — without
+redoing the conversion. OCR outputs are **named after the engine**, so repeated
+runs sit side by side instead of overwriting each other.
 
 ## What you get
 
 After `convert` you have:
 
-- `<output>/png/` — lossless PNG conversions of every HEIC (your archival copies)
+- `<output>/images/` — your individual page images (JPEG by default), in a
+  widely supported, easily browsable format
 
 After each `ocr` run (here with the default `tesseract` engine) you also have:
 
@@ -27,6 +28,29 @@ After each `ocr` run (here with the default `tesseract` engine) you also have:
 
 Run `ocr` again with `--engine gvision` and you get `transcription_gvision.txt`
 and `searchable_gvision.pdf` alongside the Tesseract ones, ready to compare.
+
+## Image format and storage
+
+By default `convert` writes **colour JPEGs at quality 92**. This is the sensible
+choice for keeping a usable image archive: JPEG opens everywhere, the files are a
+fraction of the size of a lossless PNG, and at quality 92 the loss is invisible
+for viewing and reading. Camera orientation, EXIF and colour profile are
+preserved.
+
+Options if you want something different:
+
+```bash
+--format jpeg --quality 92   # default
+--format jpeg --quality 85   # smaller files, still very legible
+--format png                 # lossless, but several times larger
+--format webp --quality 90   # smaller than JPEG, slightly less universal
+```
+
+A note on "lossless": a photograph of paper is full of sensor noise and texture,
+which lossless formats must store exactly, so PNG/lossless-WebP files stay large
+(often ~10 MB/page) and re-optimising them barely helps. If you want a truly
+lossless original, your **HEIC files already are one** (and are smaller than the
+PNGs) — keep that folder. The JPEGs here are the convenient working/viewing copy.
 
 ## Setup
 
@@ -51,14 +75,14 @@ The tool has three subcommands: `convert`, `ocr`, and `all`. Run
 ### The staged workflow (recommended)
 
 ```bash
-# Stage 1 — convert once. PNGs land in ./out/png/
+# Stage 1 — convert once. JPEGs land in ./out/images/
 python manuscript_ocr.py convert ./my_heic_folder -o ./out
 
-# Stage 2 — OCR at your leisure. Point at ./out (it finds the png/ subfolder),
-# or directly at ./out/png. Outputs are written into ./out.
+# Stage 2 — OCR at your leisure. Point at ./out (it finds the images/ subfolder),
+# or directly at ./out/images. Outputs are written into ./out.
 python manuscript_ocr.py ocr ./out --engine tesseract
 
-# Later, try a different engine on the SAME PNGs — no reconversion:
+# Later, try a different engine on the SAME images — no reconversion:
 python manuscript_ocr.py ocr ./out --engine gvision
 ```
 
@@ -66,8 +90,6 @@ You now have `transcription_tesseract.txt` / `searchable_tesseract.pdf` and
 `transcription_gvision.txt` / `searchable_gvision.pdf` side by side in `./out`.
 
 ### One pass
-
-If you just want everything in a single command:
 
 ```bash
 python manuscript_ocr.py all ./my_heic_folder -o ./out --engine tesseract
@@ -85,8 +107,8 @@ python manuscript_ocr.py convert ./my_heic_folder -o ./out --workers 8
 python manuscript_ocr.py ocr ./out --no-pdf
 ```
 
-`--workers` is available on every subcommand; the OCR options below apply to
-`ocr` and `all`.
+`--workers` is available on every subcommand. `--format` / `--quality` apply to
+`convert` and `all`; the OCR and PDF options below apply to `ocr` and `all`.
 
 ### Controlling PDF size
 
@@ -104,7 +126,8 @@ python manuscript_ocr.py ocr ./out --pdf-max-px 2500 --pdf-quality 90
 
 `--pdf-max-px` caps the longer edge in pixels (`0` disables downscaling);
 `--pdf-quality` is JPEG quality 1–95. Neither affects the text layer or the
-lossless PNGs in `png/`.
+images in `images/`. (This is separate from the `--quality` that controls your
+stored images.)
 
 ### Handwriting
 

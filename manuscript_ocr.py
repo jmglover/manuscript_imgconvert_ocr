@@ -8,13 +8,14 @@ What it does
 ------------
 The work is split into two stages you can run separately or together:
 
-  convert   Stage 1: HEIC/HEIF -> PNG, written to <output>/png/.
-  ocr       Stage 2: OCR a folder of PNGs into:
+  convert   Stage 1: HEIC/HEIF -> images, written to <output>/images/.
+            Default JPEG (quality 92, colour); --format png for lossless.
+  ocr       Stage 2: OCR a folder of images into:
               <output>/transcription_<engine>.txt   (collated, one header per page)
               <output>/searchable_<engine>.pdf      (page images + invisible text)
   all       Run convert then ocr in a single pass.
 
-Outputs are tagged with the engine name, so you can OCR the same PNGs twice
+Outputs are tagged with the engine name, so you can OCR the same images twice
 (e.g. tesseract first, gvision later) without overwriting the earlier results.
 
 OCR engines
@@ -38,7 +39,7 @@ Quick start
     # Or split it: convert once, then OCR at your leisure / with each engine:
     python manuscript_ocr.py convert ./heic_folder -o ./out
     python manuscript_ocr.py ocr ./out --engine tesseract
-    python manuscript_ocr.py ocr ./out --engine gvision     # reuses the same PNGs
+    python manuscript_ocr.py ocr ./out --engine gvision     # reuses the same images
 
     python manuscript_ocr.py ocr ./out --no-pdf             # skip the PDF
     python manuscript_ocr.py <command> --help               # all options
@@ -61,6 +62,10 @@ pillow_heif.register_heif_opener()
 
 HEIC_SUFFIXES = {".heic", ".heif", ".hif"}
 PNG_SUFFIXES = {".png"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
+
+# convert output formats -> file extension
+FORMAT_EXT = {"jpeg": ".jpg", "png": ".png", "webp": ".webp"}
 
 # A "word" is (text, x0, y0, x1, y1) with the box in pixel coords of the
 # preprocessed image that was OCR'd. These drive the PDF text layer.
@@ -80,24 +85,27 @@ def gather(src: Path, suffixes: set[str], recursive: bool) -> list[Path]:
     return sorted(files, key=natural_key)
 
 
-def resolve_png_dir(d: Path) -> Path:
-    """Accept either a folder of PNGs or an output folder containing a png/ subdir.
-
-    Lets `ocr ./out` work after `convert ... -o ./out` produced ./out/png, as well
-    as `ocr ./out/png` directly.
-    """
-    if any(p.suffix.lower() == ".png" for p in d.glob("*.png")):
+def resolve_image_dir(d: Path) -> Path:
+    """Accept a folder of images, or an output folder containing an images/ (or
+    legacy png/) subdir. Lets `ocr ./out` work after `convert ... -o ./out`."""
+    def has_images(folder: Path) -> bool:
+        return folder.is_dir() and any(
+            p.suffix.lower() in IMAGE_SUFFIXES for p in folder.iterdir() if p.is_file())
+    if has_images(d):
         return d
-    sub = d / "png"
-    if sub.is_dir() and any(sub.glob("*.png")):
-        return sub
-    return d  # leave as-is; caller reports "no PNGs found"
+    for sub in ("images", "png"):  # png/ kept for backward compatibility
+        if has_images(d / sub):
+            return d / sub
+    return d  # leave as-is; caller reports "no images found"
 
 
 # --------------------------------------------------------------------------- #
 # Conversion + preprocessing
 # --------------------------------------------------------------------------- #
-def convert_to_png(src: Path, dst: Path) -> None:
+def save_converted(src: Path, dst: Path, fmt: str, quality: int) -> None:
+    """Convert one HEIC to the chosen format, preserving colour, ICC profile and
+    EXIF (orientation/capture metadata). JPEG/WebP are lossy at `quality`; PNG is
+    lossless. Images are kept at full resolution — this is your image store."""
     with Image.open(src) as img:
         dst.parent.mkdir(parents=True, exist_ok=True)
         kwargs = {}
@@ -105,7 +113,16 @@ def convert_to_png(src: Path, dst: Path) -> None:
             kwargs["icc_profile"] = icc
         if exif := img.info.get("exif"):
             kwargs["exif"] = exif
-        img.save(dst, format="PNG", **kwargs)
+        if fmt == "png":
+            img.save(dst, format="PNG", **kwargs)
+        elif fmt == "jpeg":
+            im = img.convert("RGB") if img.mode in ("RGBA", "LA", "P") else img
+            im.save(dst, format="JPEG", quality=quality, optimize=True,
+                    progressive=True, **kwargs)
+        elif fmt == "webp":
+            img.save(dst, format="WEBP", quality=quality, method=6, **kwargs)
+        else:
+            raise ValueError(f"unknown format: {fmt}")
 
 
 def preprocess(img: Image.Image, threshold: bool, upscale_min: int) -> Image.Image:
@@ -217,13 +234,13 @@ ENGINES = {"tesseract": ocr_tesseract, "gvision": ocr_gvision, "easyocr": ocr_ea
 # Per-image workers (module-level so they are picklable for multiprocessing)
 # --------------------------------------------------------------------------- #
 def convert_one(args):
-    """Stage 1: HEIC -> PNG. Returns (png_name, error_or_None)."""
-    src, png_path = args
+    """Stage 1: HEIC -> chosen format. Returns (out_name, error_or_None)."""
+    src, dst, fmt, quality = args
     try:
-        convert_to_png(src, png_path)
-        return (png_path.name, None)
+        save_converted(src, dst, fmt, quality)
+        return (dst.name, None)
     except Exception as e:  # noqa: BLE001
-        return (png_path.name, f"{type(e).__name__}: {e}")
+        return (dst.name, f"{type(e).__name__}: {e}")
 
 
 def ocr_one(args):
@@ -341,18 +358,20 @@ def preflight(engine: str) -> str | None:
 # --------------------------------------------------------------------------- #
 # Stage 1: convert
 # --------------------------------------------------------------------------- #
-def run_convert(input_dir, output_dir, recursive, workers):
-    """HEIC -> PNG only. Returns (png_dir, n_errors)."""
+def run_convert(input_dir, output_dir, recursive, workers, fmt="jpeg", quality=92):
+    """HEIC -> images only. Returns (image_dir, n_errors)."""
     files = gather(input_dir, HEIC_SUFFIXES, recursive)
     if not files:
         print(f"No HEIC/HEIF files found in {input_dir}", file=sys.stderr)
         return (None, 0)
 
-    png_dir = output_dir / "png"
-    png_dir.mkdir(parents=True, exist_ok=True)
-    tasks = [(src, png_dir / (src.stem + ".png")) for src in files]
+    img_dir = output_dir / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    ext = FORMAT_EXT[fmt]
+    tasks = [(src, img_dir / (src.stem + ext), fmt, quality) for src in files]
 
-    print(f"[convert] {len(files)} image(s) -> {png_dir}  (workers: {workers})")
+    q = "lossless" if fmt == "png" else f"q{quality}"
+    print(f"[convert] {len(files)} image(s) -> {img_dir}  ({fmt} {q}, workers: {workers})")
     results = {}
     for name, err in imap(convert_one, tasks, workers):
         results[name] = err
@@ -361,7 +380,7 @@ def run_convert(input_dir, output_dir, recursive, workers):
 
     errors = sum(1 for e in results.values() if e)
     print(f"[convert] done: {len(results) - errors} converted, {errors} failed.")
-    return (png_dir, errors)
+    return (img_dir, errors)
 
 
 # --------------------------------------------------------------------------- #
@@ -369,25 +388,25 @@ def run_convert(input_dir, output_dir, recursive, workers):
 # --------------------------------------------------------------------------- #
 def run_ocr(png_input, output_dir, engine, lang, psm, recursive,
             threshold, upscale_min, workers, make_pdf, pdf_dpi, pdf_max_px, pdf_quality):
-    """OCR a folder of PNGs. Outputs are engine-tagged so repeated runs with
+    """OCR a folder of images. Outputs are engine-tagged so repeated runs with
     different engines don't overwrite each other."""
     if msg := preflight(engine):
         print(f"error: {msg}", file=sys.stderr)
         return 1
 
-    png_dir = resolve_png_dir(png_input)
+    img_dir = resolve_image_dir(png_input)
     if output_dir is None:
-        output_dir = png_dir.parent if png_dir.name == "png" else png_dir
+        output_dir = img_dir.parent if img_dir.name in ("images", "png") else img_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    files = gather(png_dir, PNG_SUFFIXES, recursive)
+    files = gather(img_dir, IMAGE_SUFFIXES, recursive)
     if not files:
-        print(f"No PNG files found in {png_dir}. Run the 'convert' stage first, or "
+        print(f"No images found in {img_dir}. Run the 'convert' stage first, or "
               f"point at the folder that contains them.", file=sys.stderr)
         return 1
 
     tasks = [(p, engine, lang, psm, threshold, upscale_min) for p in files]
-    print(f"[ocr] {len(files)} image(s) from {png_dir}  (engine: {engine}, workers: {workers})")
+    print(f"[ocr] {len(files)} image(s) from {img_dir}  (engine: {engine}, workers: {workers})")
     results = {}
     for path_str, text, words, err in imap(ocr_one, tasks, workers):
         results[path_str] = (text, words, err)
@@ -402,7 +421,7 @@ def run_ocr(png_input, output_dir, engine, lang, psm, recursive,
     with transcript_path.open("w", encoding="utf-8") as f:
         f.write("OCR transcription\n")
         f.write(f"Generated:        {datetime.now().isoformat(timespec='seconds')}\n")
-        f.write(f"PNG directory:    {png_dir.resolve()}\n")
+        f.write(f"Image directory:  {img_dir.resolve()}\n")
         f.write(f"Engine / lang:    {engine} / {lang}\n")
         f.write(f"Images processed: {len(ordered)}  (errors: {errors})\n\n")
         for path_str, (text, _words, err) in ordered:
@@ -435,22 +454,30 @@ def run_ocr(png_input, output_dir, engine, lang, psm, recursive,
 # Combined: all (convert then ocr, one shot)
 # --------------------------------------------------------------------------- #
 def run_all(input_dir, output_dir, engine, lang, psm, recursive,
-            threshold, upscale_min, workers, make_pdf, pdf_dpi, pdf_max_px, pdf_quality):
+            threshold, upscale_min, workers, make_pdf, pdf_dpi, pdf_max_px, pdf_quality,
+            fmt="jpeg", quality=92):
     # Check credentials before doing the conversion work, so a gvision auth
     # problem fails fast rather than after converting hundreds of images.
     if msg := preflight(engine):
         print(f"error: {msg}", file=sys.stderr)
         return 1
-    png_dir, _conv_err = run_convert(input_dir, output_dir, recursive, workers)
-    if png_dir is None:
+    img_dir, _conv_err = run_convert(input_dir, output_dir, recursive, workers, fmt, quality)
+    if img_dir is None:
         return 1
-    return run_ocr(png_dir, output_dir, engine, lang, psm, False,
+    return run_ocr(img_dir, output_dir, engine, lang, psm, False,
                    threshold, upscale_min, workers, make_pdf, pdf_dpi, pdf_max_px, pdf_quality)
 
 
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def _add_format_args(p):
+    p.add_argument("--format", choices=sorted(FORMAT_EXT), default="jpeg",
+                   help="Stored image format (default jpeg; png = lossless but large)")
+    p.add_argument("--quality", type=int, default=92,
+                   help="JPEG/WebP quality 1-95 for stored images (default 92; ignored for png)")
+
+
 def _add_ocr_args(p):
     p.add_argument("--engine", choices=sorted(ENGINES), default="tesseract",
                    help="OCR engine (default tesseract)")
@@ -481,20 +508,21 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="command", required=True)
 
     # convert
-    c = sub.add_parser("convert", help="Stage 1: HEIC -> PNG only")
+    c = sub.add_parser("convert", help="Stage 1: HEIC -> images only")
     c.add_argument("input", type=Path, help="Directory of HEIC/HEIF images")
     c.add_argument("-o", "--output", type=Path, default=Path("manuscript_output"),
-                   help="Output dir; PNGs go in <output>/png/ (default ./manuscript_output)")
+                   help="Output dir; images go in <output>/images/ (default ./manuscript_output)")
     c.add_argument("-r", "--recursive", action="store_true")
     c.add_argument("--workers", type=int, default=4)
+    _add_format_args(c)
 
     # ocr
-    o = sub.add_parser("ocr", help="Stage 2: OCR a folder of PNGs (engine-tagged output)")
+    o = sub.add_parser("ocr", help="Stage 2: OCR a folder of images (engine-tagged output)")
     o.add_argument("input", type=Path,
-                   help="Folder of PNGs, or an output folder containing a png/ subdir")
+                   help="Folder of images, or an output folder containing an images/ subdir")
     o.add_argument("-o", "--output", type=Path, default=None,
                    help="Where to write transcription_<engine>.txt / searchable_<engine>.pdf "
-                        "(default: alongside the PNGs)")
+                        "(default: alongside the images)")
     o.add_argument("-r", "--recursive", action="store_true")
     o.add_argument("--workers", type=int, default=4)
     _add_ocr_args(o)
@@ -507,6 +535,7 @@ def main(argv=None) -> int:
                    help="Output dir (default ./manuscript_output)")
     a.add_argument("-r", "--recursive", action="store_true")
     a.add_argument("--workers", type=int, default=4)
+    _add_format_args(a)
     _add_ocr_args(a)
     _add_pdf_args(a)
 
@@ -517,8 +546,9 @@ def main(argv=None) -> int:
     workers = max(1, args.workers)
 
     if args.command == "convert":
-        _png_dir, errors = run_convert(args.input, args.output, args.recursive, workers)
-        return 1 if (_png_dir is None or errors) else 0
+        _img_dir, errors = run_convert(args.input, args.output, args.recursive, workers,
+                                       args.format, args.quality)
+        return 1 if (_img_dir is None or errors) else 0
 
     if args.command == "ocr":
         return run_ocr(args.input, args.output, args.engine, args.lang, args.psm,
@@ -528,7 +558,8 @@ def main(argv=None) -> int:
     # all
     return run_all(args.input, args.output, args.engine, args.lang, args.psm,
                    args.recursive, args.threshold, args.upscale_min, workers,
-                   args.pdf, args.pdf_dpi, args.pdf_max_px, args.pdf_quality)
+                   args.pdf, args.pdf_dpi, args.pdf_max_px, args.pdf_quality,
+                   args.format, args.quality)
 
 
 if __name__ == "__main__":
